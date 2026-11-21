@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util"
 	"github.com/alireza0/s-ui/util/common"
 
@@ -58,6 +60,7 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 			"id":     inbound.Id,
 			"type":   inbound.Type,
 			"tag":    inbound.Tag,
+			"enable": inbound.Enable,
 			"tls_id": inbound.TlsId,
 		}
 		if inbound.Options != nil {
@@ -78,7 +81,7 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 			!(inbound.Type == "shadowtls" && shadowtls_version < 3) &&
 			!(inbound.Type == "shadowsocks" && ss_managed) {
 			users := []string{}
-			err = db.Raw("SELECT clients.name FROM clients, json_each(clients.inbounds) as je WHERE je.value = ?", inbound.Id).Scan(&users).Error
+			err = db.Raw("SELECT clients.name FROM clients, json_each(CAST(clients.inbounds AS TEXT)) as je WHERE je.value = ?", inbound.Id).Scan(&users).Error
 			if err != nil {
 				return nil, err
 			}
@@ -130,25 +133,31 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 				if err != nil && err != os.ErrInvalid {
 					return err
 				}
+				// Removing the listener leaves accepted connections open
+				if box := corePtr.GetInstance(); box != nil && !inbound.Enable {
+					box.SessionTracker().CloseByInbound(oldTag)
+				}
 			}
 
-			inboundConfig, err := inbound.MarshalJSON()
-			if err != nil {
-				return err
-			}
+			if inbound.Enable {
+				inboundConfig, err := inbound.MarshalJSON()
+				if err != nil {
+					return err
+				}
 
-			if act == "edit" {
-				inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
-			} else {
-				inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
-			}
-			if err != nil {
-				return err
-			}
+				if act == "edit" {
+					inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
+				} else {
+					inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
+				}
+				if err != nil {
+					return err
+				}
 
-			err = corePtr.AddInbound(inboundConfig)
-			if err != nil {
-				return err
+				err = corePtr.AddInbound(inboundConfig)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -157,9 +166,19 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 			return err
 		}
 
+		// Create skips a false bool for the column default and reads the
+		// default back into the struct, so the flag is kept and set after it
+		enable := inbound.Enable
 		err = tx.Save(&inbound).Error
 		if err != nil {
 			return err
+		}
+		if act == "new" && !enable {
+			inbound.Enable = false
+			err = tx.Model(model.Inbound{}).Where("id = ?", inbound.Id).Update("enable", false).Error
+			if err != nil {
+				return err
+			}
 		}
 		switch act {
 		case "new":
@@ -224,7 +243,7 @@ func (s *InboundService) UpdateOutJsons(tx *gorm.DB, inboundIds []uint, hostname
 func (s *InboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
 	var inboundsJson []json.RawMessage
 	var inbounds []*model.Inbound
-	err := db.Model(model.Inbound{}).Preload("Tls").Find(&inbounds).Error
+	err := db.Model(model.Inbound{}).Preload("Tls").Where("enable = ?", true).Find(&inbounds).Error
 	if err != nil {
 		return nil, err
 	}
@@ -244,13 +263,13 @@ func (s *InboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
 
 func (s *InboundService) hasUser(inboundType string) bool {
 	switch inboundType {
-	case "mixed", "socks", "http", "shadowsocks", "vmess", "trojan", "naive", "hysteria", "shadowtls", "tuic", "hysteria2", "vless", "anytls":
+	case "mixed", "socks", "http", "shadowsocks", "vmess", "trojan", "naive", "hysteria", "shadowtls", "tuic", "hysteria2", "vless", "anytls", "snell":
 		return true
 	}
 	return false
 }
 
-func (s *InboundService) fetchUsers(db *gorm.DB, inboundType string, condition string, inbound map[string]interface{}) ([]json.RawMessage, error) {
+func (s *InboundService) fetchUsers(db *gorm.DB, inboundType string, condition string, args []any, inbound map[string]interface{}) ([]json.RawMessage, error) {
 	if inboundType == "shadowtls" {
 		version, _ := inbound["version"].(float64)
 		if int(version) < 3 {
@@ -259,24 +278,31 @@ func (s *InboundService) fetchUsers(db *gorm.DB, inboundType string, condition s
 	}
 	if inboundType == "shadowsocks" {
 		method, _ := inbound["method"].(string)
-		if method == "2022-blake3-aes-128-gcm" {
-			inboundType = "shadowsocks16"
-		}
+		inboundType = util.ShadowsocksClientConfigKey(method)
 	}
 
 	var users []string
 
 	err := db.Raw(
-		fmt.Sprintf(`SELECT json_extract(clients.config, "$.%s")
+		fmt.Sprintf(`SELECT json_extract(CAST(clients.config AS TEXT), "$.%s")
 		FROM clients WHERE enable = true AND %s`,
-			inboundType, condition)).Scan(&users).Error
+			inboundType, condition), args...).Scan(&users).Error
 	if err != nil {
 		return nil, err
 	}
+	stripVision := false
+	if inboundType == "vless" {
+		transportType := ""
+		if tr, ok := inbound["transport"].(map[string]interface{}); ok {
+			transportType, _ = tr["type"].(string)
+		}
+		stripVision = inbound["tls"] == nil || transportType != ""
+	}
+
 	var usersJson []json.RawMessage
 	for _, user := range users {
-		if inboundType == "vless" && inbound["tls"] == nil {
-			user = strings.Replace(user, "xtls-rprx-vision", "", -1)
+		if stripVision {
+			user = strings.ReplaceAll(user, "xtls-rprx-vision", "")
 		}
 		usersJson = append(usersJson, json.RawMessage(user))
 	}
@@ -294,8 +320,8 @@ func (s *InboundService) addUsers(db *gorm.DB, inboundJson []byte, inboundId uin
 		return nil, err
 	}
 
-	condition := fmt.Sprintf("%d IN (SELECT json_each.value FROM json_each(clients.inbounds))", inboundId)
-	inbound["users"], err = s.fetchUsers(db, inboundType, condition, inbound)
+	condition := fmt.Sprintf("%d IN (SELECT json_each.value FROM json_each(CAST(clients.inbounds AS TEXT)))", inboundId)
+	inbound["users"], err = s.fetchUsers(db, inboundType, condition, nil, inbound)
 	if err != nil {
 		return nil, err
 	}
@@ -304,8 +330,7 @@ func (s *InboundService) addUsers(db *gorm.DB, inboundJson []byte, inboundId uin
 }
 
 func (s *InboundService) initUsers(db *gorm.DB, inboundJson []byte, clientIds string, inboundType string) ([]byte, error) {
-	ClientIds := strings.Split(clientIds, ",")
-	if len(ClientIds) == 0 {
+	if strings.TrimSpace(clientIds) == "" {
 		return inboundJson, nil
 	}
 
@@ -319,8 +344,26 @@ func (s *InboundService) initUsers(db *gorm.DB, inboundJson []byte, clientIds st
 		return nil, err
 	}
 
-	condition := fmt.Sprintf("id IN (%s)", strings.Join(ClientIds, ","))
-	inbound["users"], err = s.fetchUsers(db, inboundType, condition, inbound)
+	// The ids arrive as a form value, so they are attacker-shaped text, not
+	// numbers: splicing them into the SQL condition (id IN (%s)) let a value
+	// like "0) OR (1=1" select every enabled client, the same injection
+	// class fixed for /api/changes in #1131. Parse each id and pass the
+	// numbers as arguments instead, so nothing in the value can change
+	// the shape of the query.
+	parts := strings.Split(clientIds, ",")
+	ids := make([]any, 0, len(parts))
+	marks := make([]string, 0, len(parts))
+	for _, part := range parts {
+		id, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
+		if err != nil {
+			return nil, common.NewError("invalid client id: ", part)
+		}
+		ids = append(ids, id)
+		marks = append(marks, "?")
+	}
+
+	condition := "id IN (" + strings.Join(marks, ",") + ")"
+	inbound["users"], err = s.fetchUsers(db, inboundType, condition, ids, inbound)
 	if err != nil {
 		return nil, err
 	}
@@ -328,12 +371,82 @@ func (s *InboundService) initUsers(db *gorm.DB, inboundJson []byte, clientIds st
 	return json.Marshal(inbound)
 }
 
-func (s *InboundService) RestartInbounds(tx *gorm.DB, ids []uint) error {
-	if !corePtr.IsRunning() {
+func (s *InboundService) enabledClientNames(tx *gorm.DB, inboundId uint) (map[string]struct{}, error) {
+	var names []string
+	err := tx.Raw(
+		"SELECT clients.name FROM clients, json_each(CAST(clients.inbounds AS TEXT)) AS je WHERE je.value = ? AND clients.enable = true",
+		inboundId).Scan(&names).Error
+	if err != nil {
+		return nil, err
+	}
+	keep := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		keep[name] = struct{}{}
+	}
+	return keep, nil
+}
+
+func (s *InboundService) UpdateInboundsUsers(tx *gorm.DB, ids []uint) error {
+	// Held for the whole loop below, which interleaves DB queries with core
+	// calls. Re-reading the instance after each query would let a restart
+	// swap the box mid-loop; a nil here just means the core is down.
+	box := corePtr.GetInstance()
+	if box == nil {
 		return nil
 	}
 	var inbounds []*model.Inbound
-	err := tx.Model(model.Inbound{}).Preload("Tls").Where("id in ?", ids).Find(&inbounds).Error
+	// A disabled inbound is not in the core, and re-adding it here would turn it back on
+	err := tx.Model(model.Inbound{}).Preload("Tls").Where("id in ? AND enable = ?", ids, true).Find(&inbounds).Error
+	if err != nil {
+		return err
+	}
+	for _, inbound := range inbounds {
+		inboundConfig, err := inbound.MarshalJSON()
+		if err != nil {
+			return err
+		}
+		inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
+		if err != nil {
+			return err
+		}
+
+		handled, err := corePtr.UpdateInboundUsers(inboundConfig)
+		if err != nil {
+			return err
+		}
+		if handled {
+			// Disconnect only users no longer enabled on this inbound
+			keep, err := s.enabledClientNames(tx, inbound.Id)
+			if err != nil {
+				return err
+			}
+			closed := box.SessionTracker().CloseByInboundUsers(inbound.Tag, keep)
+			cut := corePtr.CloseInboundUserSessions(inbound.Tag, keep)
+			logger.Debug("updated users of inbound ", inbound.Tag, " in place, closed ", closed, " stale connections and ", cut, " sessions")
+			continue
+		}
+
+		// Fallback: full restart for protocols without in-place user updates
+		err = corePtr.RemoveInbound(inbound.Tag)
+		if err != nil && err != os.ErrInvalid {
+			return err
+		}
+		box.SessionTracker().CloseByInbound(inbound.Tag)
+		err = corePtr.AddInbound(inboundConfig)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *InboundService) RestartInbounds(tx *gorm.DB, ids []uint) error {
+	box := corePtr.GetInstance()
+	if box == nil {
+		return nil
+	}
+	var inbounds []*model.Inbound
+	err := tx.Model(model.Inbound{}).Preload("Tls").Where("id in ? AND enable = ?", ids, true).Find(&inbounds).Error
 	if err != nil {
 		return err
 	}
@@ -343,7 +456,7 @@ func (s *InboundService) RestartInbounds(tx *gorm.DB, ids []uint) error {
 			return err
 		}
 		// Close all existing connections
-		corePtr.GetInstance().ConnTracker().CloseConnByInbound(inbound.Tag)
+		box.SessionTracker().CloseByInbound(inbound.Tag)
 
 		inboundConfig, err := inbound.MarshalJSON()
 		if err != nil {

@@ -47,7 +47,7 @@ func (o *EndpointService) GetAll() (*[]map[string]interface{}, error) {
 func (o *EndpointService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
 	var endpointsJson []json.RawMessage
 	var endpoints []*model.Endpoint
-	err := db.Model(model.Endpoint{}).Scan(&endpoints).Error
+	err := db.Model(model.Endpoint{}).Find(&endpoints).Error
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +71,6 @@ func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		if err != nil {
 			return err
 		}
-
 		if endpoint.Type == "warp" {
 			if act == "new" {
 				err = s.WarpService.RegisterWarp(&endpoint)
@@ -80,7 +79,7 @@ func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 				}
 			} else {
 				var old_license string
-				err = tx.Model(model.Endpoint{}).Select("json_extract(ext, '$.license_key')").Where("id = ?", endpoint.Id).Find(&old_license).Error
+				err = tx.Model(model.Endpoint{}).Select("json_extract(CAST(ext AS TEXT), '$.license_key')").Where("id = ?", endpoint.Id).Find(&old_license).Error
 				if err != nil {
 					return err
 				}

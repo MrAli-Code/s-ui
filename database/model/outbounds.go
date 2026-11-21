@@ -23,7 +23,7 @@ func (o *Outbound) UnmarshalJSON(data []byte) error {
 	delete(raw, "id")
 	o.Type, _ = raw["type"].(string)
 	delete(raw, "type")
-	o.Tag = raw["tag"].(string)
+	o.Tag, _ = raw["tag"].(string)
 	delete(raw, "tag")
 
 	// Remaining fields
@@ -46,6 +46,15 @@ func (o Outbound) MarshalJSON() ([]byte, error) {
 
 		for k, v := range restFields {
 			combined[k] = v
+		}
+	}
+
+	if tlsRaw, ok := combined["tls"].(json.RawMessage); ok {
+		var tlsObj map[string]interface{}
+		if json.Unmarshal(tlsRaw, &tlsObj) == nil {
+			if enabled, _ := tlsObj["enabled"].(bool); !enabled {
+				delete(combined, "tls")
+			}
 		}
 	}
 

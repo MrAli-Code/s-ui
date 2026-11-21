@@ -46,6 +46,10 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.RestartApp(c)
 	case "restartSb":
 		a.ApiService.RestartSb(c)
+	case "maintenance":
+		a.ApiService.SetMaintenance(c)
+	case "resetTraffic":
+		a.ApiService.ResetTraffic(c)
 	case "linkConvert":
 		a.ApiService.LinkConvert(c)
 	case "subConvert":
@@ -58,6 +62,12 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 	case "deleteToken":
 		a.ApiService.DeleteToken(c)
 		a.apiv2.ReloadTokens()
+	case "closeSessions":
+		a.ApiService.CloseSessions(c)
+	case "update":
+		a.ApiService.Upgrade(c)
+	case "getCertPing":
+		a.ApiService.GetCertPing(c)
 	default:
 		jsonMsg(c, "failed", common.NewError("unknown action: ", action))
 	}
@@ -87,12 +97,16 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetStatus(c)
 	case "onlines":
 		a.ApiService.GetOnlines(c)
+	case "sessions":
+		a.ApiService.GetSessions(c)
 	case "logs":
 		a.ApiService.GetLogs(c)
 	case "changes":
 		a.ApiService.CheckChanges(c)
 	case "keypairs":
 		a.ApiService.GetKeypairs(c)
+	case "checkUpdate":
+		a.ApiService.CheckUpdate(c)
 	case "getdb":
 		a.ApiService.GetDb(c)
 	case "tokens":

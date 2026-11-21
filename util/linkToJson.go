@@ -1,8 +1,10 @@
 package util
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -31,9 +33,50 @@ func GetOutbound(uri string, i int) (*map[string]interface{}, string, error) {
 			return tuic(u, i)
 		case "ss", "shadowsocks":
 			return ss(u, i)
+		case "http", "https", "socks", "socks5":
+			return parseProxyLink(u, i)
+		case "naive+https", "naive+quic", "http2":
+			return parseNaiveLink(u, i)
 		}
 	}
 	return nil, "", common.NewError("Unsupported link format")
+}
+
+func parseProxyLink(u *url.URL, i int) (*map[string]interface{}, string, error) {
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if host == "" || err != nil || port < 1 || port > 65535 || u.Path != "" {
+		return nil, "", common.NewError("Invalid proxy link")
+	}
+	tag := u.Fragment
+	if tag == "" {
+		tag = net.JoinHostPort(host, u.Port())
+	}
+	if i > 0 {
+		tag = fmt.Sprintf("%d.%s", i, tag)
+	}
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		password, _ = u.User.Password()
+	}
+	outbound := map[string]interface{}{
+		"type":        "http",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"username":    username,
+		"password":    password,
+	}
+	switch u.Scheme {
+	case "https":
+		query := u.Query()
+		outbound["tls"] = getTls("tls", &query)
+	case "socks", "socks5":
+		outbound["type"] = "socks"
+		outbound["version"] = "5"
+	}
+	return &outbound, tag, nil
 }
 
 func vmess(data string, i int) (*map[string]interface{}, string, error) {
@@ -200,17 +243,9 @@ func hy(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		port, _ = strconv.Atoi(portStr)
 	}
 
-	tls := map[string]interface{}{
-		"enabled":     true,
-		"server_name": query.Get("peer"),
-	}
-	alpn := query.Get("alpn")
-	insecure := query.Get("insecure")
-	if len(alpn) > 0 {
-		tls["alpn"] = strings.Split(alpn, ",")
-	}
-	if insecure == "1" || insecure == "true" {
-		tls["insecure"] = true
+	security := query.Get("security")
+	if len(security) == 0 {
+		security = "tls"
 	}
 
 	tag := u.Fragment
@@ -224,7 +259,7 @@ func hy(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		"server_port": port,
 		"obfs":        query.Get("obfsParam"),
 		"auth_str":    query.Get("auth"),
-		"tls":         tls,
+		"tls":         getTls(security, &query),
 	}
 	down, _ := strconv.Atoi(query.Get("downmbps"))
 	up, _ := strconv.Atoi(query.Get("upmbps"))
@@ -253,17 +288,9 @@ func hy2(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		port, _ = strconv.Atoi(portStr)
 	}
 
-	tls := map[string]interface{}{
-		"enabled":     true,
-		"server_name": query.Get("sni"),
-	}
-	alpn := query.Get("alpn")
-	insecure := query.Get("insecure")
-	if len(alpn) > 0 {
-		tls["alpn"] = strings.Split(alpn, ",")
-	}
-	if insecure == "1" || insecure == "true" {
-		tls["insecure"] = true
+	security := query.Get("security")
+	if len(security) == 0 {
+		security = "tls"
 	}
 
 	tag := u.Fragment
@@ -276,22 +303,30 @@ func hy2(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		"server":      host,
 		"server_port": port,
 		"password":    u.User.Username(),
-		"tls":         tls,
+		"tls":         getTls(security, &query),
 	}
 	down, _ := strconv.Atoi(query.Get("downmbps"))
 	up, _ := strconv.Atoi(query.Get("upmbps"))
 	obfs := query.Get("obfs")
+	mport := strings.ReplaceAll(query.Get("mport"), "-", ":")
+	fastopen := query.Get("fastopen")
 	if down > 0 {
 		hy2["down_mbps"] = down
 	}
 	if up > 0 {
 		hy2["up_mbps"] = up
 	}
-	if obfs == "salamander" {
+	if obfs == "salamander" || obfs == "gecko" {
 		hy2["obfs"] = map[string]interface{}{
-			"type":     "salamander",
+			"type":     obfs,
 			"password": query.Get("obfs-password"),
 		}
+	}
+	if len(mport) > 0 {
+		hy2["server_ports"] = strings.Split(mport, ",")
+	}
+	if fastopen == "1" || fastopen == "true" {
+		hy2["fastopen"] = true
 	}
 	return &hy2, tag, nil
 }
@@ -304,17 +339,9 @@ func anytls(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		port, _ = strconv.Atoi(portStr)
 	}
 
-	tls := map[string]interface{}{
-		"enabled":     true,
-		"server_name": query.Get("sni"),
-	}
-	alpn := query.Get("alpn")
-	insecure := query.Get("insecure")
-	if len(alpn) > 0 {
-		tls["alpn"] = strings.Split(alpn, ",")
-	}
-	if insecure == "1" || insecure == "true" {
-		tls["insecure"] = true
+	security := query.Get("security")
+	if len(security) == 0 {
+		security = "tls"
 	}
 
 	tag := u.Fragment
@@ -327,7 +354,7 @@ func anytls(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		"server":      host,
 		"server_port": port,
 		"password":    u.User.Username(),
-		"tls":         tls,
+		"tls":         getTls(security, &query),
 	}
 	return &anytls, tag, nil
 }
@@ -340,21 +367,9 @@ func tuic(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		port, _ = strconv.Atoi(portStr)
 	}
 
-	tls := map[string]interface{}{
-		"enabled":     true,
-		"server_name": query.Get("sni"),
-	}
-	alpn := query.Get("alpn")
-	insecure := query.Get("allow_insecure")
-	disable_sni := query.Get("disable_sni")
-	if len(alpn) > 0 {
-		tls["alpn"] = strings.Split(alpn, ",")
-	}
-	if insecure == "1" || insecure == "true" {
-		tls["insecure"] = true
-	}
-	if disable_sni == "1" || disable_sni == "true" {
-		tls["disable_sni"] = true
+	security := query.Get("security")
+	if len(security) == 0 {
+		security = "tls"
 	}
 
 	tag := u.Fragment
@@ -371,12 +386,27 @@ func tuic(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		"password":           password,
 		"congestion_control": query.Get("congestion_control"),
 		"udp_relay_mode":     query.Get("udp_relay_mode"),
-		"tls":                tls,
+		"tls":                getTls(security, &query),
 	}
 	return &tuic, tag, nil
 }
 
 func ss(u *url.URL, i int) (*map[string]interface{}, string, error) {
+	if u.User == nil {
+		decoded, err := decodeBase64(u.Host + strings.TrimSuffix(u.Path, "/"))
+		if err != nil {
+			return nil, "", common.NewError("Unsupported shadowsocks")
+		}
+		idx := strings.LastIndex(string(decoded), "@")
+		if idx == -1 {
+			return nil, "", common.NewError("Unsupported shadowsocks")
+		}
+		legacy := *u
+		legacy.User = url.UserPassword(splitMethod(string(decoded[:idx])))
+		legacy.Host = string(decoded[idx+1:])
+		legacy.Path = ""
+		u = &legacy
+	}
 	query, _ := url.ParseQuery(u.RawQuery)
 	host, portStr, _ := net.SplitHostPort(u.Host)
 	port := 443
@@ -436,6 +466,96 @@ func ss(u *url.URL, i int) (*map[string]interface{}, string, error) {
 	return &ss, tag, nil
 }
 
+func splitMethod(userInfo string) (string, string) {
+	method, password, _ := strings.Cut(userInfo, ":")
+	return method, password
+}
+
+func parseNaiveLink(u *url.URL, i int) (*map[string]interface{}, string, error) {
+	var host, portStr, username, password string
+	var port int
+
+	switch u.Scheme {
+	case "http2":
+		decoded := StrOrBase64Encoded(u.Hostname())
+		// LastIndex, not Index: the userinfo is not escaped inside the base64
+		// payload, so a password containing an @ split the string at the wrong
+		// place and produced a host of "ss@example.test" out of thin air.
+		if idx := strings.LastIndex(decoded, "@"); idx != -1 {
+			userInfo := decoded[:idx]
+			hostPort := decoded[idx+1:]
+			// First colon, so a password containing one stays whole.
+			if idx2 := strings.Index(userInfo, ":"); idx2 != -1 {
+				username = userInfo[:idx2]
+				password = userInfo[idx2+1:]
+			} else {
+				username = userInfo
+			}
+			host, portStr, _ = net.SplitHostPort(hostPort)
+			if portStr != "" {
+				port, _ = strconv.Atoi(portStr)
+			} else {
+				port = 443
+			}
+		} else {
+			return nil, "", common.NewError("Invalid naive link (http2)")
+		}
+	case "naive+https", "naive+quic":
+		host, portStr, _ = net.SplitHostPort(u.Host)
+		if portStr != "" {
+			port, _ = strconv.Atoi(portStr)
+		} else {
+			port = 443
+		}
+		if u.User != nil {
+			username = u.User.Username()
+			password, _ = u.User.Password()
+		}
+	default:
+		return nil, "", common.NewError("Unsupported naive scheme")
+	}
+
+	tag := u.Fragment
+	if i > 0 {
+		tag = fmt.Sprintf("%d.%s", i, u.Fragment)
+	}
+	if tag == "" {
+		tag = fmt.Sprintf("naive-%d", i)
+	}
+
+	naive := map[string]interface{}{
+		"type":        "naive",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"username":    username,
+		"password":    password,
+		"tls":         map[string]interface{}{"enabled": true},
+	}
+
+	query := u.Query()
+	if peer := query.Get("peer"); peer != "" {
+		if tls, ok := naive["tls"].(map[string]interface{}); ok {
+			tls["server_name"] = peer
+		}
+	}
+	if insecure := query.Get("insecure"); insecure == "1" || insecure == "true" {
+		if tls, ok := naive["tls"].(map[string]interface{}); ok {
+			tls["insecure"] = true
+		}
+	}
+	if alpn := query.Get("alpn"); alpn != "" {
+		if tls, ok := naive["tls"].(map[string]interface{}); ok {
+			tls["alpn"] = strings.Split(alpn, ",")
+		}
+	}
+	if u.Scheme == "naive+quic" {
+		naive["quic"] = true
+	}
+
+	return &naive, tag, nil
+}
+
 func getTransport(tp_type string, q *url.Values) map[string]interface{} {
 	transport := map[string]interface{}{}
 	tp_host := q.Get("host")
@@ -476,13 +596,55 @@ func getTransport(tp_type string, q *url.Values) map[string]interface{} {
 	return transport
 }
 
+// GetOutboundForClash preserves VLESS encryption and XHTTP for Clash YAML exports.
+// Regular external links for Happ and sing-box JSON exports stay unchanged.
+func GetOutboundForClash(uri string, i int) (*map[string]interface{}, string, error) {
+	outbound, tag, err := GetOutbound(uri, i)
+	if err != nil || outbound == nil {
+		return outbound, tag, err
+	}
+	u, parseErr := url.Parse(uri)
+	if parseErr != nil || u.Scheme != "vless" {
+		return outbound, tag, err
+	}
+	q := u.Query()
+	if encryption := q.Get("encryption"); encryption != "" {
+		(*outbound)["encryption"] = encryption
+	}
+	tp := strings.ToLower(q.Get("type"))
+	if tp != "xhttp" && tp != "splithttp" {
+		return outbound, tag, err
+	}
+	transport := map[string]interface{}{"type": "xhttp"}
+	for _, key := range []string{"host", "path", "mode"} {
+		if q.Has(key) {
+			transport[key] = q.Get(key)
+		}
+	}
+	if raw := q.Get("extra"); raw != "" && raw != "null" {
+		var extra map[string]interface{}
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		if decoder.Decode(&extra) == nil && len(extra) > 0 {
+			var trailing interface{}
+			if decoder.Decode(&trailing) == io.EOF {
+				transport["extra"] = extra
+			}
+		}
+	}
+	(*outbound)["transport"] = transport
+	return outbound, tag, nil
+}
+
 func getTls(security string, q *url.Values) map[string]interface{} {
 	tls := map[string]interface{}{}
 	tls_fp := q.Get("fp")
 	tls_sni := q.Get("sni")
-	tls_insecure := q.Get("allowInsecure")
+	tls_allow_insecure := q.Get("allowInsecure")
+	tls_insecure := q.Get("insecure")
 	tls_alpn := q.Get("alpn")
 	tls_ech := q.Get("ech")
+	disable_sni := q.Get("disable_sni")
 	switch security {
 	case "tls":
 		tls["enabled"] = true
@@ -500,7 +662,7 @@ func getTls(security string, q *url.Values) map[string]interface{} {
 	if len(tls_alpn) > 0 {
 		tls["alpn"] = strings.Split(tls_alpn, ",")
 	}
-	if tls_insecure == "1" || tls_insecure == "true" {
+	if tls_insecure == "1" || tls_insecure == "true" || tls_allow_insecure == "1" || tls_allow_insecure == "true" {
 		tls["insecure"] = true
 	}
 	if len(tls_fp) > 0 {
@@ -509,13 +671,36 @@ func getTls(security string, q *url.Values) map[string]interface{} {
 			"fingerprint": tls_fp,
 		}
 	}
-	if len(tls_ech) > 0 {
-		tls["ech"] = map[string]interface{}{
-			"enabled": true,
-			"config": []string{
-				tls_ech,
-			},
-		}
+	if ech := echFromLink(tls_ech); ech != nil {
+		tls["ech"] = ech
+	}
+	if disable_sni == "1" || disable_sni == "true" {
+		tls["disable_sni"] = true
 	}
 	return tls
+}
+
+// echFromLink reads a link's ech value: the base64 ECHConfigList, which
+// sing-box takes as a PEM block, or Xray's "domain+DNS" form, whose domain is
+// where the config is looked up instead.
+func echFromLink(value string) map[string]interface{} {
+	// A raw + in the query decodes to a space
+	value = strings.ReplaceAll(strings.TrimSpace(value), " ", "+")
+	if value == "" {
+		return nil
+	}
+	if list, err := base64.StdEncoding.DecodeString(value); err == nil &&
+		len(list) > 2 && int(list[0])<<8|int(list[1]) == len(list)-2 {
+		return map[string]interface{}{
+			"enabled": true,
+			"config":  []string{"-----BEGIN ECH CONFIGS-----", value, "-----END ECH CONFIGS-----"},
+		}
+	}
+	if name, _, found := strings.Cut(value, "+"); found && strings.Contains(name, ".") {
+		return map[string]interface{}{
+			"enabled":           true,
+			"query_server_name": name,
+		}
+	}
+	return nil
 }
